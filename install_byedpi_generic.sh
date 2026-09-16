@@ -95,7 +95,11 @@ run_root(){ # строка-команда
 }
 
 # ---------------------------------------------------------------------------
-# Скачивание ciadpi с GitHub
+# Скачивание ciadpi с GitHub (hufrea/byedpi releases).
+# Адрес НЕ собирается из версии: файл под нашу архитектуру ищется в списке
+# файлов последнего релиза, поэтому смена версии или имени файла его не
+# ломает (в релизах byedpi файлы идут как byedpi-17.3-x86_64.tar.gz при
+# теге v0.17.3 — собирать такой адрес из тега нельзя).
 # ---------------------------------------------------------------------------
 install_binary(){
   if [ -x "$CIADPI" ] && [ "$ACTION" = "install" ] && [ -z "$ARG_PORT" ]; then
@@ -103,27 +107,47 @@ install_binary(){
     return 0
   fi
   case "$(uname -m)" in
-    x86_64)             ARCH=x86_64 ;;
-    aarch64|arm64)      ARCH=aarch64 ;;
-    armv7*|armhf)       ARCH=armv7l ;;
-    armv6*|arm)         ARCH=armv6 ;;
-    i686|x86|i586|i486) ARCH=i686 ;;
-    mips)               ARCH=mips ;;
-    mipsel)             ARCH=mipsel ;;
-    powerpc|ppc*)       ARCH=powerpc ;;
+    x86_64)             ARCH=x86_64;  TOKS="x86_64 amd64" ;;
+    aarch64|arm64)      ARCH=aarch64; TOKS="aarch64 arm64" ;;
+    armv7*|armhf)       ARCH=armv7l;  TOKS="armv7l armv7 armhf" ;;
+    armv6*|arm)         ARCH=armv6;   TOKS="armv6" ;;
+    i686|x86|i586|i486) ARCH=i686;    TOKS="i686 386" ;;
+    mips)               ARCH=mips;    TOKS="mips" ;;
+    mipsel)             ARCH=mipsel;  TOKS="mipsel" ;;
+    powerpc|ppc*)       ARCH=powerpc; TOKS="powerpc ppc" ;;
     *) log_err "Незнакомая архитектура: $(uname -m)" ;;
   esac
 
   log_ok "Архитектура: $ARCH. Узнаю последний релиз byedpi..."
-  latest=$(curl -fsSL --max-time 20 https://api.github.com/repos/hufrea/byedpi/releases/latest 2>/dev/null \
-           | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  api=$(curl -fsSL --max-time 30 https://api.github.com/repos/hufrea/byedpi/releases/latest 2>/dev/null || true)
+  latest=$(printf '%s' "$api" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
   [ -n "$latest" ] || latest=v0.17.3
-  ver=$(printf '%s' "$latest" | tr -d 'v')
-  url="https://github.com/hufrea/byedpi/releases/download/$latest/byedpi-$ver-$ARCH.tar.gz"
-  log_ok "Скачиваю: $url"
+
+  urls=""
+  # 1) Ищем файл для нашей архитектуры в списке файлов последнего релиза
+  for tok in $TOKS; do
+    u=$(printf '%s' "$api" \
+        | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | sed 's/.*"\(https[^"]*\)".*/\1/' \
+        | grep -i -- "$tok" | grep -Ei '\.(tar\.gz|tgz)$' | head -1)
+    [ -n "$u" ] && { urls="$u"; break; }
+  done
+  # 2) Резерв: если список релиза недоступен (лимит API и т.п.), пробуем
+  #    известные варианты имени — с полной версией и без ведущего "0."
+  if [ -z "$urls" ]; then
+    ver=$(printf '%s' "$latest" | tr -d 'v')
+    urls="https://github.com/hufrea/byedpi/releases/download/$latest/byedpi-${ver#0.}-$ARCH.tar.gz
+          https://github.com/hufrea/byedpi/releases/download/$latest/byedpi-$ver-$ARCH.tar.gz"
+  fi
+
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
-  curl -fsSL --max-time 120 -o "$tmpdir/byedpi.tgz" "$url" || log_err "Не удалось скачать $url"
+  ok=
+  for u in $urls; do
+    log_ok "Скачиваю: $u"
+    if curl -fsSL --max-time 120 -o "$tmpdir/byedpi.tgz" "$u"; then ok=1; break; fi
+  done
+  [ -n "$ok" ] || log_err "Не удалось скачать ciadpi (пробовал: $urls)"
   tar -xzf "$tmpdir/byedpi.tgz" -C "$tmpdir" || log_err "Не удалось распаковать архив"
   bin=$(find "$tmpdir" -maxdepth 1 -type f -name 'ciadpi*' | head -1)
   [ -n "$bin" ] || log_err "В архиве нет ciadpi"
