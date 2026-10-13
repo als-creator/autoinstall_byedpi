@@ -27,10 +27,12 @@ set -u
 
 usage(){
   cat <<EOF
-Использование: $0 [--ipset|--extension] [--off|--status|--test] [--port N] [--no-test]
+Использование: $0 [--ipset|--extension] [--off|--status|--test|--check] [--port N] [--no-test]
   --ipset         метод ipset: весь TCP 80/443 через ByeDPI, фильтр по SNI
   --extension     метод extension: SOCKS-прокси для браузерного расширения
   --test          перезапустить автотест стратегий и обновить /etc/byedpi/rule
+  --check         проверить минимальный набор доменов (rutracker/nnm-club/
+                  youtube/rutor) и сказать, что именно не открывается
   --no-test       пропустить автотест стратегий при установке
   --off | --remove  отключить и удалить всё
   --status|--info   показать текущее состояние
@@ -58,6 +60,7 @@ for a in "$@"; do
     --off|--remove) ACTION=off ;;
     --status|--info) ACTION=status ;;
     --test|--retest) ACTION=test ;;
+    --check)    ACTION=check ;;
     --no-test)   NO_TEST=1 ;;
     --help|-h)   usage ;;
     --port=*)    ARG_PORT="${a#*=}" ;;
@@ -161,10 +164,27 @@ install_binary(){
 # ---------------------------------------------------------------------------
 # Автотест стратегий
 # ---------------------------------------------------------------------------
-TEST_PROBES="i.ytimg.com pbs.twimg.com yt3.ggpht.com www.youtube.com discord.com rutracker.org x.com www.instagram.com"
+probe_direct(){ # домен -> 0, если открывается "как есть" (без прокси).
+    # 3 попытки: часть блокировок статистическая (DPI смотрит не все потоки),
+    # одиночный запрос не показателен.
+    i=0
+    while [ $i -lt 3 ]; do
+        code=$(curl -k -sS -m 8 -o /dev/null -w '%{http_code}' "https://$1/" 2>/dev/null)
+        [ -n "$code" ] && [ "$code" != "000" ] && return 0
+        i=$((i+1)); sleep 0.5
+    done
+    return 1
+}
+
+# Минимальный набор доменов, который обязан открываться:
+#   rutor / rutracker / nnm-club / youtube
+# Именно по нему выбирается правило desync.
+TEST_PROBES="rutracker.org nnmclub.to www.youtube.com i.ytimg.com yt3.googleusercontent.com rutor.info"
 
 TEST_RULES="\
 long-strategy|-d1 -d3+s -s6+s -d9+s -s12+s -d15+s -s20+s -d25+s -s30+s -d35+s -r1+s -S -a1 -As -d1 -d3+s -s6+s -d9+s -s12+s -d15+s -s20+s -d25+s -s30+s -d35+s -S -a1
+multisplit-d1|-Kt,h -d1 -d3+s -s6+s -d9+s -s12+s -d15+s -s20+s -s25+s -s30+s -s35+s -r1+s -S -a1 -As
+disorder-sni|-Kt,h --disorder 1 -s0 -r1+s -f-1 -a5 -An
 tlsrec-disorder|-Kt,h --tlsrec 1+s --disorder 1 --auto=torst --timeout 3
 fake-found|-Kt,h --fake -1 --md5sig --auto=torst --timeout 3
 disorder-1|-Kt,h --disorder 1 --auto=torst --timeout 3
@@ -180,39 +200,68 @@ test_strategies(){ # hostlist-файл -> on stdout лучшее правило;
 
     tport=$(( 14600 + ($$ % 250) ))
     resfile="/tmp/byedpi-test-$$.res"
-    pdir="/tmp/byedpi-probes-$$"
-    mkdir -p "$pdir"
+    rawdir="/tmp/byedpi-probes-$$"
+    mkdir -p "$rawdir"
     > "$resfile"
 
     echo "=== Автотест стратегий desync ===" >&2
-    echo "Пробы: $TEST_PROBES" >&2
+    echo "Минимальный набор: $TEST_PROBES" >&2
     printf '%b\n' "$TEST_RULES" | while IFS='|' read -r name rule; do
       [ -n "$rule" ] || continue
       "$CIADPI" -H "$hosts" -i 127.0.0.1 --port "$tport" $rule >/dev/null 2>&1 &
       cpid=$!
       sleep 0.6
+      pdir="$rawdir/$name"
+      rm -rf "$pdir"; mkdir -p "$pdir"
       i=0
       curls=""
       for h in $TEST_PROBES; do
         i=$((i+1))
-        ( code=$(curl -k -sS -m 4 --socks5-hostname 127.0.0.1:"$tport" -o /dev/null -w "%{http_code}" "https://$h/" 2>/dev/null)
+        ( code=$(curl -k -sS -m 6 --socks5-hostname 127.0.0.1:"$tport" -o /dev/null -w "%{http_code}" "https://$h/" 2>/dev/null)
           echo "$code" > "$pdir/$i" ) &
         curls="$curls $!"
       done
       wait $curls
       kill "$cpid" 2>/dev/null
       wait "$cpid" 2>/dev/null
-      ok=0; total=0
-      for f in "$pdir"/*; do
-        [ -f "$f" ] || continue
+      ok=0; total=0; line=""
+      for h in $TEST_PROBES; do
         total=$((total+1))
-        code=$(cat "$f")
-        if [ -n "$code" ] && [ "$code" != "000" ]; then ok=$((ok+1)); fi
+        code=$(cat "$pdir/$total" 2>/dev/null)
+        if [ -n "$code" ] && [ "$code" != "000" ]; then
+          ok=$((ok+1)); line="$line $h=OK"
+        else
+          line="$line $h=FAIL"
+        fi
       done
-      echo "  [$name] $rule  →  открылось $ok из $total" >&2
+      printf '  [%-16s] %s\n' "$name" "$line" >&2
       echo "$name|$ok|$total|$rule" >> "$resfile"
     done
-    rm -rf "$pdir"
+
+    # Домены, не открывшиеся НИ ОДНИМ правилом: скорее всего заблокированы по IP
+    # либо по TLS-отпечатку (JA3). desync по SNI такие блокировки не снимает.
+    unreachable=""
+    for h in $TEST_PROBES; do
+      opened=0
+      for d in "$rawdir"/*; do
+        [ -d "$d" ] || continue
+        idx=0
+        for h2 in $TEST_PROBES; do
+          idx=$((idx+1))
+          [ "$h2" = "$h" ] || continue
+          code=$(cat "$d/$idx" 2>/dev/null)
+          [ -n "$code" ] && [ "$code" != "000" ] && opened=1
+        done
+      done
+      [ "$opened" -eq 0 ] && unreachable="$unreachable $h"
+    done
+    if [ -n "$unreachable" ]; then
+      log_warn "Не открылись ни одним правилом:$unreachable" >&2
+      for h in $unreachable; do
+        probe_direct "$h" && log_warn "  $h: напрямую открывается — домен не в списке desync ($HOSTS_FILE)" >&2 \
+          || log_warn "  $h: напрямую тоже не открывается — блок по IP или по отпечатку ClientHello (JA3)" >&2
+      done
+    fi
 
     best=""; bname=""; bscore=-1; btotal=0
     while IFS='|' read -r name score total rule; do
@@ -220,6 +269,7 @@ test_strategies(){ # hostlist-файл -> on stdout лучшее правило;
         bscore=$score; btotal=$total; bname=$name; best=$rule
       fi
     done < "$resfile"
+    rm -rf "$rawdir"
     rm -f "$resfile"
 
     if [ -z "$best" ]; then
@@ -263,19 +313,45 @@ write_hostlist(){
     run_root "mkdir -p '$DIR'"
     cat > /tmp/byedpi-hosts.$$ <<'EOL'
 # ByeDPI hostlist — домены, к которым применяется desync.
-# Список синхронизирован с расширением ZeroOmega (55 доменов).
 # Формат: один домен на строку, строки с # игнорируются.
 # Правка: отредактируйте и перезапустите сервисы (см. README).
-cdnbunny.org
-youtube.com
-googlevideo.com
-play.google.com
-yt3.ggpht.com
-youtu.be
+#
+# --- МИНИМУМ (проверяется командой `скрипт --check`) -----------------------
+# Rutor
 rutor.info
+rutor.is
+# Rutracker
 rutracker.org
 rutracker.cc
+# NNM-Club
 nnmclub.to
+nnmclub.me
+# YouTube (включая CDN-поддомены)
+youtube.com
+googlevideo.com
+ytimg.com
+ggpht.com
+youtu.be
+yt.be
+play.google.com
+youtubei.googleapis.com
+youtube.googleapis.com
+yt3.googleusercontent.com
+news.google.com
+# CDN и служебные домены (проверено резолвом)
+# YouTube: apex-ы часто без A-записи, но нужны для матчинга поддоменов
+gstatic.com
+googleusercontent.com
+l.google.com
+1e100.net
+m.youtube.com
+img.youtube.com
+yt3.ggpht.com
+yt4.ggpht.com
+youtube.ru
+# ---------------------------------------------------------------------------
+# Остальные домены (Discord, соцсети, архивы, обход блокировок)
+cdnbunny.org
 habr.com
 instagram.com
 archlinuxgui.in
@@ -311,16 +387,12 @@ bbc.com
 addons.opera.com
 twitter.com
 holod.media
-news.google.com
 flibusta.lib
 flibusta.is
 flibusta.info
 linkedin.com
 t.co
 x.com
-ytimg.com
-yt3.googleusercontent.com
-ggpht.com
 EOL
     run_root "tee '$HOSTS_FILE' > /dev/null < /tmp/byedpi-hosts.$$"
     rm -f /tmp/byedpi-hosts.$$
@@ -558,6 +630,50 @@ cmd_test(){
   log_ok "Демон перезапущен."
 }
 
+# Проверка минимального набора доменов через работающий демон.
+# Для каждого домена: OK / статистическая фильтрация / нет-в-списке /
+# блок по IP или по отпечатку ClientHello.
+cmd_check(){
+  command -v curl >/dev/null 2>&1 || log_err "Для проверки нужен curl"
+  echo "=== Проверка минимального набора доменов ==="
+  [ -f "$RULE_FILE" ] && echo "Правило: $(cat "$RULE_FILE")"
+  echo
+  for h in $TEST_PROBES; do
+    # 3 попытки: DPI бывает статистическим и открывает не каждый поток
+    i=0; code=""
+    while [ $i -lt 3 ]; do
+      code=$(curl -k -sS -m 8 -o /dev/null -w '%{http_code}' "https://$h/" 2>/dev/null)
+      [ -n "$code" ] && [ "$code" != "000" ] && break
+      i=$((i+1)); sleep 0.5
+    done
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+      if [ $i -gt 0 ]; then
+        printf '  %-30s OK с %d-й попытки (%s) — фильтрация статистическая\n' "$h" "$((i+1))" "$code"
+      else
+        printf '  %-30s OK (%s)\n' "$h" "$code"
+      fi
+      continue
+    fi
+    inlist=no
+    if [ -f "$HOSTS_FILE" ]; then
+      re=$(printf '%s' "$h" | sed 's/\./\\./g')
+      grep -qE "^[[:space:]]*${re}([[:space:]]*\$|[[:space:]]*#)" "$HOSTS_FILE" 2>/dev/null && inlist=yes
+    fi
+    if [ "$inlist" = yes ]; then
+      printf '  %-30s FAIL 3/3 (домен есть в hosts) — desync не помогает\n' "$h"
+    elif probe_direct "$h"; then
+      printf '  %-30s FAIL (напрямую открывается, но домена нет в hosts)\n' "$h"
+    else
+      printf '  %-30s FAIL 3/3 — блок по IP или по отпечатку ClientHello\n' "$h"
+    fi
+  done
+  echo
+  echo "Подсказка: если домен открывается напрямую (curl без прокси) — добавьте его"
+  echo "в $HOSTS_FILE и перезапустите демон. Если FAIL 3/3 и напрямую, то"
+  echo "блокируют либо по IP, либо по TLS-отпечатку — desync/SNI не поможет."
+  exit 0
+}
+
 # ---------------------------------------------------------------------------
 # Главный запуск
 # ---------------------------------------------------------------------------
@@ -565,6 +681,7 @@ case "$ACTION" in
   status) cmd_status ;;
   off)    cmd_off ;;
   test)   cmd_test ;;
+  check)  cmd_check ;;
   install)
     install_binary
     write_port
