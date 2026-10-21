@@ -638,6 +638,20 @@ cmd_status(){
     echo "ByeDPI не установлен (нет юнита/init-скрипта)"
   fi
   [ -f /etc/byedpi/conf ] && { echo "system config: /etc/byedpi/conf";    [ -f /etc/byedpi/rule ] && echo "rule: $(cat /etc/byedpi/rule)";   [ -f /etc/byedpi/port ] && echo "port: $(cat /etc/byedpi/port)"; }
+  if [ -f "$CFG" ]; then
+    m=$(current_mode)
+    echo "режим:   $m"
+    if [ "$m" = "transparent" ]; then
+      if systemctl is-active --quiet byedpi-redirect 2>/dev/null; then
+        echo "перехват: активен (byedpi-redirect)"
+      else
+        echo "перехват: [WARN] НЕ активен (byedpi-redirect) — трафик идёт мимо byedpi"
+      fi
+      echo "браузер:  напрямую; socks5 $PORT в transparent не работает (расширение выключить)"
+    else
+      echo "браузер:  через socks5 127.0.0.1:$PORT"
+    fi
+  fi
   exit 0
 }
 
@@ -670,16 +684,56 @@ cmd_test(){
 # Проверка минимального набора доменов через работающий демон.
 # Для каждого домена: OK / статистическая фильтрация / нет-в-списке /
 # блок по IP или по отпечатку ClientHello.
+# Режим работы из конфига: transparent | socks
+current_mode(){
+  m=""
+  if [ -f "$CFG" ]; then
+    m=$(sed -n 's/^BYEDPI_MODE="\{0,1\}\([a-z]*\)"\{0,1\}.*/\1/p' "$CFG" | head -1)
+  fi
+  echo "${m:-socks}"
+}
+
+# Одна проба домена тем путём, которым реально ходит трафик:
+# transparent — напрямую (перехватывает iptables), socks — через SOCKS5.
+probe_via_mode(){ # домен -> http_code
+  if [ "$(current_mode)" = "transparent" ]; then
+    curl -k -sS -m 8 -o /dev/null -w '%{http_code}' "https://$1/" 2>/dev/null
+  else
+    curl -k -sS -m 8 --socks5-hostname 127.0.0.1:"$PORT" -o /dev/null -w '%{http_code}' "https://$1/" 2>/dev/null
+  fi
+}
+
+# Проверка минимального набора доменов тем путём, которым ходит браузер.
 cmd_check(){
   command -v curl >/dev/null 2>&1 || log_err "Для проверки нужен curl"
+  mode=$(current_mode)
   echo "=== Проверка минимального набора доменов ==="
+  echo "Режим: $mode"
   [ -f "$RULE_FILE" ] && echo "Правило: $(cat "$RULE_FILE")"
+  if [ "$mode" = "transparent" ]; then
+    echo "  Трафик TCP 80/443 перехватывает iptables (REDIRECT) — браузер ходит напрямую."
+    if systemctl is-active --quiet byedpi-redirect 2>/dev/null; then
+      echo "  Перехват: активен (byedpi-redirect)"
+    else
+      echo "  [WARN] Перехват не активен: systemctl status byedpi-redirect"
+    fi
+    sc=$(curl -k -sS -m 4 --socks5-hostname 127.0.0.1:"$PORT" -o /dev/null -w '%{http_code}' https://www.youtube.com/ 2>/dev/null)
+    if [ "$sc" = "000" ]; then
+      echo "  [WARN] Порт $PORT не принимает SOCKS5 — в transparent так и должно быть."
+      echo "         Если браузер/ZeroOmega настроен на socks5 127.0.0.1:$PORT,"
+      echo "         выключите расширение (или профиль 'прямое соединение'), иначе"
+      echo "         сайты не откроются: SOCKS-запросы уходят в никуда."
+    fi
+  else
+    echo "  Браузер должен ходить через SOCKS5 127.0.0.1:$PORT."
+    echo "  Перехвата iptables нет: без прокси в браузере трафик идёт напрямую."
+  fi
   echo
   for h in $TEST_PROBES; do
     # 3 попытки: DPI бывает статистическим и открывает не каждый поток
     i=0; code=""
     while [ $i -lt 3 ]; do
-      code=$(curl -k -sS -m 8 -o /dev/null -w '%{http_code}' "https://$h/" 2>/dev/null)
+      code=$(probe_via_mode "$h")
       [ -n "$code" ] && [ "$code" != "000" ] && break
       i=$((i+1)); sleep 0.5
     done
@@ -701,13 +755,15 @@ cmd_check(){
     elif probe_direct "$h"; then
       printf '  %-30s FAIL (напрямую открывается, но домена нет в hosts)\n' "$h"
     else
-      printf '  %-30s FAIL 3/3 — блок по IP или по отпечатку ClientHello\n' "$h"
+      printf '  %-30s FAIL 3/3 — блок по IP или по отпечатку ClientHello (JA3)\n' "$h"
     fi
   done
   echo
   echo "Подсказка: если домен открывается напрямую (curl без прокси) — добавьте его"
   echo "в $HOSTS_FILE и перезапустите демон. Если FAIL 3/3 и напрямую, то"
-  echo "блокируют либо по IP, либо по TLS-отпечатку — desync/SNI не поможет."
+  echo "блокируют либо по IP, либо по TLS-отпечатку (JA3) — desync/SNI не поможет."
+  echo "QUIC (UDP 443) не перехватывается: если сайт тормозит при рабочем TCP,"
+  echo "проверьте его поведение при выключенном HTTP/3 в браузере."
   exit 0
 }
 
