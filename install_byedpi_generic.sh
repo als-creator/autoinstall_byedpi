@@ -27,9 +27,13 @@ set -u
 
 usage(){
   cat <<EOF
-Использование: $0 [--ipset|--extension] [--off|--status|--test|--check|--update] [--port N] [--no-test] [--keep-files]
+Использование: $0 [--ipset|--extension] [--off|--status|--test|--check|--update] [--port N] [--no-test] [--keep-files] [--block-quic|--allow-quic]
   --ipset         метод ipset: весь TCP 80/443 через ByeDPI, фильтр по SNI
   --extension     метод extension: SOCKS-прокси для браузерного расширения
+  --block-quic    блокировать UDP 443 (QUIC): браузер сразу идёт по TCP через
+                  ByeDPI, без чёрного экрана на время таймаута HTTP/3
+                  (по умолчанию включено для --ipset)
+  --allow-quic    не блокировать QUIC (вернуть прежнее поведение)
   --test          перезапустить автотест стратегий и обновить /etc/byedpi/rule
   --check         проверить минимальный набор доменов (rutracker/nnm-club/
                   youtube/rutor) и сказать, что именно не открывается
@@ -54,6 +58,7 @@ log_err(){ echo "[ERROR] $*" >&2; exit 1; }
 METHOD=""          # ipset | extension
 ACTION="install"   # install | update | off | status | test | check
 KEEP_FILES=""      # --keep-files: не перезаписывать существующие hosts/rule
+BLOCK_QUIC=""      # yes|no; пусто — взять из conf или по умолчанию (ipset: yes)
 ARG_PORT=""
 NO_TEST=""
 
@@ -67,6 +72,8 @@ for a in "$@"; do
     --check)    ACTION=check ;;
     --update|--upgrade) ACTION=update ;;
     --keep-files) KEEP_FILES=1 ;;
+    --block-quic) BLOCK_QUIC=yes ;;
+    --allow-quic) BLOCK_QUIC=no ;;
     --no-test)   NO_TEST=1 ;;
     --help|-h)   usage ;;
     --port=*)    ARG_PORT="${a#*=}" ;;
@@ -185,7 +192,7 @@ probe_direct(){ # домен -> 0, если открывается "как ес�
 # Минимальный набор доменов, который обязан открываться:
 #   rutor / rutracker / nnm-club / youtube
 # Именно по нему выбирается правило desync.
-TEST_PROBES="rutracker.org nnmclub.to www.youtube.com i.ytimg.com yt3.googleusercontent.com rutor.info"
+TEST_PROBES="rutracker.org nnmclub.to www.youtube.com redirector.googlevideo.com i.ytimg.com yt3.googleusercontent.com rutor.info"
 
 TEST_RULES="\
 long-strategy|-d1 -d3+s -s6+s -d9+s -s12+s -d15+s -s20+s -d25+s -s30+s -d35+s -r1+s -S -a1 -As -d1 -d3+s -s6+s -d9+s -s12+s -d15+s -s20+s -d25+s -s30+s -d35+s -S -a1
@@ -466,8 +473,58 @@ write_conf(){
 BYEDPI_BIND=\"127.0.0.1\"
 BYEDPI_PORT_FILE=\"$PORT_FILE\"
 BYEDPI_RULE_FILE=\"$RULE_FILE\"
-BYEDPI_HOSTS_FILE=\"$HOSTS_FILE\""
+BYEDPI_HOSTS_FILE=\"$HOSTS_FILE\"
+# Блокировка QUIC (UDP 443): браузер сразу идёт по TCP через ByeDPI.
+BYEDPI_BLOCK_QUIC=\"$BLOCK_QUIC\""
   log_ok "Конфиг: $CFG"
+}
+
+# ---------------------------------------------------------------------------
+# QUIC (UDP 443)
+#
+# ByeDPI перехватывает только TCP (REDIRECT -p tcp). UDP 443 идёт мимо, и если
+# провайдер его режет, браузер висит на HTTP/3 до таймаута: YouTube показывает
+# чёрный экран/крутилку, хотя TCP через ByeDPI работает. Быстрый REJECT
+# заставляет браузер сразу переключиться на TCP.
+# ---------------------------------------------------------------------------
+quic_flag_from_conf(){
+  [ -f "$CFG" ] || return 1
+  v=$(sed -n 's/^BYEDPI_BLOCK_QUIC="\{0,1\}\([a-z]*\)"\{0,1\}.*/\1/p' "$CFG" | head -1)
+  [ -n "$v" ] || return 1
+  echo "$v"
+}
+
+# Итоговое значение: флаг из аргументов > значение из conf > по умолчанию.
+# По умолчанию блокируем только в transparent (ipset): в socks-режиме браузер
+# и так ходит через прокси, а QUIC при прокси не используется.
+resolve_quic_flag(){
+  if [ -z "$BLOCK_QUIC" ]; then
+    # При явной установке берём значение по умолчанию для выбранного метода;
+    # при --update сохраняем то, что пользователь выбрал раньше.
+    if [ "$ACTION" != "install" ] && v=$(quic_flag_from_conf); then
+      BLOCK_QUIC=$v
+    elif [ "$METHOD" = "ipset" ]; then
+      BLOCK_QUIC=yes
+    else
+      BLOCK_QUIC=no
+    fi
+  fi
+  if [ "$BLOCK_QUIC" = "yes" ] && [ "$METHOD" != "ipset" ]; then
+    log_warn "QUIC блокируется только в --ipset (transparent); в --extension правило не нужно"
+    BLOCK_QUIC=no
+  fi
+}
+
+# Сохранить выбор в conf, чтобы --status/--check/--update его видели.
+write_quic_flag(){
+  [ -f "$CFG" ] || return 0
+  cur=$(quic_flag_from_conf) || cur=""
+  [ "$cur" = "$BLOCK_QUIC" ] && return 0
+  if [ -n "$cur" ]; then
+    run_root "sed -i 's|^BYEDPI_BLOCK_QUIC=.*|BYEDPI_BLOCK_QUIC=\"$BLOCK_QUIC\"|' '$CFG'"
+  else
+    run_root "printf '%s\\n' 'BYEDPI_BLOCK_QUIC=\"$BLOCK_QUIC\"' >> '$CFG'"
+  fi
 }
 
 write_launcher(){
@@ -574,9 +631,56 @@ EOF
       rm -f /tmp/byedpi-redirect.$$
       run_root "systemctl daemon-reload"
       run_root "systemctl enable --now byedpi-redirect >/dev/null 2>&1 || true"
+
+      if [ "$BLOCK_QUIC" = "yes" ]; then
+        cat > /tmp/byedpi-quic.$$ <<'EOF'
+[Unit]
+Description=Block QUIC (UDP 443) so browsers use TCP through ByeDPI
+Documentation=https://github.com/hufrea/byedpi
+After=network-online.target
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '\
+iptables -t filter -N BYEDPI_QUIC 2>/dev/null || true; \
+iptables -t filter -F BYEDPI_QUIC; \
+iptables -t filter -A BYEDPI_QUIC -p udp --dport 443 -m owner ! --uid-owner 0 -j REJECT --reject-with icmp-port-unreachable; \
+iptables -t filter -C OUTPUT -j BYEDPI_QUIC 2>/dev/null || iptables -t filter -A OUTPUT -j BYEDPI_QUIC'
+ExecStop=/bin/sh -c '\
+iptables -t filter -D OUTPUT -j BYEDPI_QUIC 2>/dev/null || true; \
+iptables -t filter -F BYEDPI_QUIC 2>/dev/null || true; \
+iptables -t filter -X BYEDPI_QUIC 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        run_root "install -m 644 /tmp/byedpi-quic.$$ /etc/systemd/system/byedpi-quic.service"
+        rm -f /tmp/byedpi-quic.$$
+        run_root "systemctl daemon-reload"
+        run_root "systemctl enable --now byedpi-quic >/dev/null 2>&1 || true"
+      fi
+    fi
+    # Юнит живёт только в transparent-режиме с включённой блокировкой:
+    # в socks-режиме и при --allow-quic его нужно убрать (и почистить iptables).
+    if { [ "$BLOCK_QUIC" != "yes" ] || [ "$METHOD" != "ipset" ]; } && \
+       [ -f /etc/systemd/system/byedpi-quic.service ]; then
+      run_root "systemctl disable --now byedpi-quic 2>/dev/null || true"
+      run_root "rm -f /etc/systemd/system/byedpi-quic.service"
+      run_root "systemctl daemon-reload"
+      run_root "iptables -t filter -D OUTPUT -j BYEDPI_QUIC 2>/dev/null || true"
+      run_root "iptables -t filter -F BYEDPI_QUIC 2>/dev/null || true"
+      run_root "iptables -t filter -X BYEDPI_QUIC 2>/dev/null || true"
     fi
     log_ok "systemd-юниты: byedpi.service${METHOD:+ (+ redirect — ipset)}"
   else
+    QUIC_START=""
+    QUIC_STOP=""
+    if [ "$BLOCK_QUIC" = "yes" ]; then
+      QUIC_START='    iptables -t filter -N BYEDPI_QUIC 2>/dev/null || true; iptables -t filter -F BYEDPI_QUIC; iptables -t filter -A BYEDPI_QUIC -p udp --dport 443 -m owner ! --uid-owner 0 -j REJECT --reject-with icmp-port-unreachable; iptables -t filter -C OUTPUT -j BYEDPI_QUIC 2>/dev/null || iptables -t filter -A OUTPUT -j BYEDPI_QUIC'
+      QUIC_STOP='  iptables -t filter -D OUTPUT -j BYEDPI_QUIC 2>/dev/null || true; iptables -t filter -F BYEDPI_QUIC 2>/dev/null || true; iptables -t filter -X BYEDPI_QUIC 2>/dev/null || true'
+    fi
     cat > /tmp/byedpi-initd.$$ <<EOF
 #!/bin/sh
 # ByeDPI init-скрипт (без systemd). Запускает launcher и настраивает iptables.
@@ -598,6 +702,7 @@ start(){
     iptables -t nat -A "\$IHOSTS" -d 169.254.0.0/16 -j RETURN
     iptables -t nat -A "\$IHOSTS" -p tcp -m owner ! --uid-owner 0 -m multiport --dports 80,443 -j REDIRECT --to-ports "\$P"
     iptables -t nat -A OUTPUT -j "\$IHOSTS"
+$QUIC_START
   fi
   echo "ByeDPI запущен (pid \$(cat /run/byedpi.pid))"
 }
@@ -607,6 +712,7 @@ stop(){
   iptables -t nat -D OUTPUT -j "\$IHOSTS" 2>/dev/null || true
   iptables -t nat -F "\$IHOSTS" 2>/dev/null || true
   iptables -t nat -X "\$IHOSTS" 2>/dev/null || true
+$QUIC_STOP
   echo "ByeDPI остановлен"
 }
 case "\$1" in
@@ -647,6 +753,11 @@ cmd_status(){
       else
         echo "перехват: [WARN] НЕ активен (byedpi-redirect) — трафик идёт мимо byedpi"
       fi
+      if [ "$(quic_flag_from_conf 2>/dev/null || echo no)" = "yes" ]; then
+        echo "QUIC:     UDP 443 блокируется (byedpi-quic) — браузер пойдёт по TCP"
+      else
+        echo "QUIC:     не блокируется (UDP 443 идёт мимо byedpi)"
+      fi
       echo "браузер:  напрямую; socks5 $PORT в transparent не работает (расширение выключить)"
     else
       echo "браузер:  через socks5 127.0.0.1:$PORT"
@@ -658,15 +769,18 @@ cmd_status(){
 cmd_off(){
   echo "=== Отключение ByeDPI ==="
   if [ "$SYSTEMD" = "yes" ]; then
-    for n in byedpi byedpi-redirect; do
+    for n in byedpi byedpi-redirect byedpi-quic; do
       run_root "systemctl disable --now $n 2>/dev/null || true"
     done
-    run_root "rm -f /etc/systemd/system/byedpi.service /etc/systemd/system/byedpi-redirect.service; systemctl daemon-reload 2>/dev/null || true"
+    run_root "rm -f /etc/systemd/system/byedpi.service /etc/systemd/system/byedpi-redirect.service /etc/systemd/system/byedpi-quic.service; systemctl daemon-reload 2>/dev/null || true"
   fi
   run_root "rm -f /etc/init.d/byedpi"
   run_root "iptables -t nat -D OUTPUT -j $IHOSTS 2>/dev/null || true"
   run_root "iptables -t nat -F $IHOSTS 2>/dev/null || true"
   run_root "iptables -t nat -X $IHOSTS 2>/dev/null || true"
+  run_root "iptables -t filter -D OUTPUT -j BYEDPI_QUIC 2>/dev/null || true"
+  run_root "iptables -t filter -F BYEDPI_QUIC 2>/dev/null || true"
+  run_root "iptables -t filter -X BYEDPI_QUIC 2>/dev/null || true"
   run_root "rm -rf $DIR $LAUNCHER /usr/local/bin/ciadpi"
   echo "ByeDPI отключён. Конфиги и бинарник удалены."
   exit 0
@@ -762,8 +876,30 @@ cmd_check(){
   echo "Подсказка: если домен открывается напрямую (curl без прокси) — добавьте его"
   echo "в $HOSTS_FILE и перезапустите демон. Если FAIL 3/3 и напрямую, то"
   echo "блокируют либо по IP, либо по TLS-отпечатку (JA3) — desync/SNI не поможет."
-  echo "QUIC (UDP 443) не перехватывается: если сайт тормозит при рабочем TCP,"
-  echo "проверьте его поведение при выключенном HTTP/3 в браузере."
+  if [ "$mode" = "transparent" ]; then
+    # QUIC (UDP 443) ByeDPI не перехватывает: REDIRECT только для TCP. Если
+    # провайдер режет UDP 443, браузер висит на HTTP/3 до таймаута — это и есть
+    # чёрный экран/крутилка YouTube при рабочем TCP. Проверяем фактически.
+    qflag=$(quic_flag_from_conf 2>/dev/null || echo no)
+    if [ "$qflag" = "yes" ]; then
+      echo "QUIC:     UDP 443 блокируется (byedpi-quic) — браузер идёт по TCP, ок"
+    elif curl --version 2>/dev/null | grep -qi 'HTTP3'; then
+      q_ok=0
+      for i in 1 2 3; do
+        c=$(curl -sS --http3-only -m 5 -o /dev/null -w '%{http_code}' https://www.youtube.com/ 2>/dev/null)
+        [ -n "$c" ] && [ "$c" != "000" ] && q_ok=$((q_ok+1))
+      done
+      if [ "$q_ok" -eq 0 ]; then
+        echo "QUIC:     [WARN] 0/3 — UDP 443 не проходит, а блокировка выключена."
+        echo "          Браузер может висеть на HTTP/3 (чёрный экран YouTube)."
+        echo "          Лечится: $0 --update --block-quic"
+      else
+        echo "QUIC:     $q_ok/3 проходит — блокировка не требуется"
+      fi
+    else
+      echo "QUIC:     curl без поддержки HTTP/3 — проверить нельзя"
+    fi
+  fi
   exit 0
 }
 
@@ -781,7 +917,9 @@ case "$ACTION" in
     install_binary
     write_hostlist
     write_rule
+    resolve_quic_flag
     write_conf
+    write_quic_flag
     write_launcher
     write_units
     service_ctl restart
@@ -797,7 +935,9 @@ case "$ACTION" in
     write_port
     write_hostlist
     write_rule
+    resolve_quic_flag
     write_conf
+    write_quic_flag
     write_launcher
     write_units
     service_ctl restart
@@ -810,6 +950,11 @@ case "$ACTION" in
     echo "          после правки любых файлов повторите $0 --status / restart."
     if [ "$METHOD" = "ipset" ]; then
       echo "  Прозрачный режим: весь TCP 80/443 -> ByeDPI, фильтр по SNI."
+      if [ "$BLOCK_QUIC" = "yes" ]; then
+        echo "  QUIC (UDP 443): заблокирован (byedpi-quic) — браузер идёт по TCP."
+      else
+        echo "  QUIC (UDP 443): не заблокирован — возможен чёрный экран YouTube."
+      fi
     else
       echo "  SOCKS-прокси: 127.0.0.1:$PORT (расширения FoxyProxy/SwitchyOmega 3)."
     fi

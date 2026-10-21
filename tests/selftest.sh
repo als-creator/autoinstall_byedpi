@@ -131,6 +131,25 @@ if [ -n "${DIRA:-}" ]; then
     if [ -n "${DIRA2:-}" ]; then
         check "hosts снова с доменами" "$(grep -qxF 'youtube.com' "$DIRA2/hosts" && echo 0 || echo 1)"
         check "после --off нет хвоста .bak" "$(ls "$DIRA2"/*.bak-* >/dev/null 2>&1 && echo 1 || echo 0)"
+
+        # --- 6. QUIC: блокировка только в transparent --------------------
+        echo "6) --ipset: блокировка QUIC включена по умолчанию"
+        run_installer --ipset --no-test >"$WORK/t6.log" 2>&1
+        check "conf: BYEDPI_BLOCK_QUIC=yes" "$(grep -q '^BYEDPI_BLOCK_QUIC="yes"' "$DIRA2/conf" && echo 0 || echo 1)"
+        check "юнит byedpi-quic создан" "$([ -f "$ROOT/etc/systemd/system/byedpi-quic.service" ] && echo 0 || echo 1)"
+        check "юнит блокирует UDP 443" "$(grep -q 'udp --dport 443' "$ROOT/etc/systemd/system/byedpi-quic.service" && echo 0 || echo 1)"
+        check "юнит использует цепочку BYEDPI_QUIC" "$(grep -q 'BYEDPI_QUIC' "$ROOT/etc/systemd/system/byedpi-quic.service" && echo 0 || echo 1)"
+        check "юнит откатывает правило при stop" "$(grep -q 'filter -D OUTPUT -j BYEDPI_QUIC' "$ROOT/etc/systemd/system/byedpi-quic.service" && echo 0 || echo 1)"
+
+        echo "7) --allow-quic: юнит удалён, флаг no"
+        run_installer --ipset --update --allow-quic --no-test >"$WORK/t7.log" 2>&1
+        check "conf: BYEDPI_BLOCK_QUIC=no" "$(grep -q '^BYEDPI_BLOCK_QUIC="no"' "$DIRA2/conf" && echo 0 || echo 1)"
+        check "юнит byedpi-quic удалён" "$([ ! -f "$ROOT/etc/systemd/system/byedpi-quic.service" ] && echo 0 || echo 1)"
+
+        echo "8) --block-quic: возвращается"
+        run_installer --ipset --update --block-quic --no-test >"$WORK/t8.log" 2>&1
+        check "conf: BYEDPI_BLOCK_QUIC=yes" "$(grep -q '^BYEDPI_BLOCK_QUIC="yes"' "$DIRA2/conf" && echo 0 || echo 1)"
+        check "юнит byedpi-quic снова создан" "$([ -f "$ROOT/etc/systemd/system/byedpi-quic.service" ] && echo 0 || echo 1)"
     fi
 else
     bad "каталог конфигов не найден — дальше проверять нечего"
