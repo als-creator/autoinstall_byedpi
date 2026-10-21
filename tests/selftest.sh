@@ -84,10 +84,12 @@ check "каталог конфигов создан" "$([ -n "${DIRA:-}" ] && ec
 if [ -n "${DIRA:-}" ]; then
     n=$(grep -vcE '^[[:space:]]*(#|$)' "$DIRA/hosts" 2>/dev/null || echo 0)
     check "hosts создан и содержит домены ($n)" "$([ "${n:-0}" -gt 50 ] && echo 0 || echo 1)"
-    for d in rutracker.org nnmclub.to youtube.com rutor.info; do
+    for d in rutracker.org nnmclub.to youtube.com rutor.info signal.org meduza.io; do
         grep -qxF "$d" "$DIRA/hosts" 2>/dev/null
         check "в hosts есть $d" "$?"
     done
+    grep -q '^TEST_PROBES=.*discord\.com' "$SCRIPT" && ! grep -q '^TEST_PROBES=.*rutor\.info' "$SCRIPT"
+    check "--check проверяет discord.com, а не rutor" "$?"
     check "rule непустой" "$([ -s "$DIRA/rule" ] && echo 0 || echo 1)"
     check "port непустой" "$([ -s "$DIRA/port" ] && echo 0 || echo 1)"
     check "conf непустой" "$([ -s "$DIRA/conf" ] && echo 0 || echo 1)"
