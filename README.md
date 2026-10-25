@@ -6,11 +6,38 @@ Linux** — без пакетного менеджера. Скрипт сам с
 получает права root (root → sudo → su), поэтому работает и на Arch, и на
 Debian/Ubuntu, и на ALT Linux (где нет sudo), и на Fedora, и на любых других.
 
-Установка одной командой:
+## Быстрый старт
+
+Основная установка — **без расширения** (`ipset`: весь TCP 80/443 идёт через
+ByeDPI, фильтр по SNI, в браузере ничего настраивать не нужно):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && sh /tmp/byedpi.sh
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh
 ```
+
+Режим с расширением (SOCKS-прокси для браузера):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh --extension
+```
+
+Статус, перепроверка и удаление:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh --status
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh --check
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh --off
+```
+
+`--off` удаляет сервисы, правила iptables, конфиги **и сам byedpi** (пакет
+`byedpi-bin` / `byedpi` или скачанный `ciadpi`). Оставить пакет:
+`--off --keep-package`.
+
+> Запускать можно и через `sh /tmp/byedpi.sh` — `chmod +x` нужен только для
+> прямого запуска вида `/tmp/byedpi.sh --status`.
+
+---
+
 
 > **Нужен установщик именно для Arch Linux (пакет из AUR)?** — смотрите
 > [als-creator/autoinstall_byedpi_archlinux](https://github.com/als-creator/autoinstall_byedpi_archlinux).
@@ -80,11 +107,11 @@ DPI (Deep Packet Inspection) провайдера. Он не подменяет 
 
 ### Автоматическая установка
 
-По умолчанию (без флагов) скрипт ставит ByeDPI в **SOCKS-режиме** для
-расширения браузера:
+По умолчанию (без флагов) скрипт ставит ByeDPI **без расширения** — режим
+`ipset` (transparent), весь TCP 80/443 идёт через ByeDPI:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && sh /tmp/byedpi.sh
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh
 ```
 
 ### Установка с флагами
@@ -92,13 +119,13 @@ curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main
 **Вариант 1. Без расширений (весь TCP 80/443 через ByeDPI, фильтр по SNI):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && sh /tmp/byedpi.sh --ipset
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh --ipset
 ```
 
 **Вариант 2. SOCKS-прокси для расширения браузера (явно):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && sh /tmp/byedpi.sh --extension
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh --extension
 ```
 
 > **Какой вариант выбрать?**
@@ -117,18 +144,18 @@ curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main
 ### Статус
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && sh /tmp/byedpi.sh --status
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh --status
 ```
 
 ### Полное удаление (отключение)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && sh /tmp/byedpi.sh --off
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh --off
 ```
 
 `--off` останавливает и удаляет сервисы (`byedpi.service` или
 `/etc/init.d/byedpi`), правила iptables, конфиг `/etc/byedpi` и бинарник
-`/usr/local/bin/ciadpi`.
+`/usr/local/bin/ciadpi`. Если бинарник нужно оставить — `--off --keep-package`.
 
 ### Сервис вручную
 
@@ -297,7 +324,7 @@ sudo systemctl restart byedpi
 всего из них:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && sh /tmp/byedpi.sh --test
+curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main/install_byedpi_generic.sh -o /tmp/byedpi.sh && chmod +x /tmp/byedpi.sh && /tmp/byedpi.sh --test
 ```
 
 Пропустить автоподбор при установке можно флагом `--no-test`.
@@ -305,7 +332,7 @@ curl -fsSL https://raw.githubusercontent.com/als-creator/autoinstall_byedpi/main
 Проверить, что открывается прямо сейчас:
 
 ```bash
-sh /tmp/byedpi.sh --check
+/tmp/byedpi.sh --check
 ```
 
 `--check` делает по 3 попытки на домен и различает ситуации:
